@@ -4,3 +4,8 @@
 .packages
 build/
 *.log
+.env
+.env*
+*.env
+*.properties
+
