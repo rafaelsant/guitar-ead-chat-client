@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base href="/">
+
+  <meta charset="UTF-8">
+  <meta content="IE=Edge" http-equiv="X-UA-Compatible">
+  <meta name="description" content="Real-Time Audio Platform PoC for musicians.">
+
+  <!-- iOS meta tags & icons -->
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black">
+  <meta name="apple-mobile-web-app-title" content="Guitar EAD Chat">
+
+  <title>Guitar EAD Chat</title>
+
+  <script>
+    var serviceWorkerVersion = null;
+  </script>
+  <!-- This script adds the flutter initialization JS code -->
+  <script src="flutter.js" defer></script>
+</head>
+<body>
+  <div id="loading">
+    <style>
+      body {
+        background-color: #0F0E17;
+        color: #FFFFFF;
+        font-family: sans-serif;
+        display: flex;
+        justify-content: center;
+        align-items: center;
+        height: 100vh;
+        margin: 0;
+      }
+      .spinner {
+        border: 4px solid rgba(255, 255, 255, 0.1);
+        width: 36px;
+        height: 36px;
+        border-radius: 50%;
+        border-left-color: #8B5CF6;
+        animation: spin 1s linear infinite;
+      }
+      @keyframes spin {
+        0% { transform: rotate(0deg); }
+        100% { transform: rotate(360deg); }
+      }
+    </style>
+    <div class="spinner"></div>
+  </div>
+  <script>
+    window.addEventListener('load', function(ev) {
+      _flutter.loader.loadEntrypoint({
+        serviceWorker: {
+          serviceWorkerVersion: serviceWorkerVersion,
+        },
+        onEntrypointLoaded: function(engineInitializer) {
+          engineInitializer.initializeEngine().then(function(appRunner) {
+            appRunner.runApp();
+          });
+        }
+      });
+    });
+  </script>
+</body>
+</html>

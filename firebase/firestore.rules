@@ -1,0 +1,27 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper function to check if the user is authenticated
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    // Helper to check if the caller is the owner of the user profile
+    function isOwner(userId) {
+      return request.auth.uid == userId;
+    }
+
+    // Rules for user profiles
+    match /users/{userId} {
+      allow read, write: if isAuthenticated() && isOwner(userId);
+    }
+
+    // Rules for rooms
+    match /rooms/{roomId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated() && request.resource.data.createdBy == request.auth.uid;
+      allow update, delete: if isAuthenticated() && resource.data.createdBy == request.auth.uid;
+    }
+  }
+}
