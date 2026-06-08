@@ -39,6 +39,7 @@ class WebRTCService extends ChangeNotifier {
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
   RTCVideoRenderer? _localRenderer;
+  Future<void>? _localStreamFuture;
   
   bool _isConnected = false;
   bool _isJoined = false;
@@ -61,6 +62,7 @@ class WebRTCService extends ChangeNotifier {
   
   // Active remote participants
   final List<RemoteParticipant> _remoteParticipants = [];
+  final List<RTCIceCandidate> _queuedCandidates = [];
 
   bool get isConnected => _isConnected;
   bool get isJoined => _isJoined;
@@ -171,7 +173,8 @@ class WebRTCService extends ChangeNotifier {
         await _localRenderer!.initialize();
 
         // 2. Setup Local Stream
-        await _acquireLocalStream();
+        _localStreamFuture = _acquireLocalStream();
+        await _localStreamFuture;
 
         // 3. Setup Connection
         if (_callType == 'sfu') {
@@ -187,6 +190,9 @@ class WebRTCService extends ChangeNotifier {
         if (_callType == 'p2p') {
           _p2pPartnerId = userId;
           _p2pPartnerName = username;
+          if (_localStreamFuture != null) {
+            await _localStreamFuture;
+          }
           // The host (who is already in room) initiates P2P connection when guest joins
           await _initializeP2PPeerConnection(userId, isOfferer: true);
         }
@@ -205,6 +211,10 @@ class WebRTCService extends ChangeNotifier {
       case 'offer':
         final String sdp = payload['sdp'];
         final String? senderUserId = payload['senderUserId'];
+
+        if (_localStreamFuture != null) {
+          await _localStreamFuture;
+        }
 
         if (_callType == 'p2p') {
           if (senderUserId != null) {
@@ -246,15 +256,18 @@ class WebRTCService extends ChangeNotifier {
         break;
 
       case 'candidate':
-        if (_peerConnection == null) return;
         final Map<String, dynamic> candidateMap = payload['candidate'];
-        await _peerConnection!.addCandidate(
-          RTCIceCandidate(
-            candidateMap['candidate'],
-            candidateMap['sdpMid'],
-            candidateMap['sdpMLineIndex'],
-          ),
+        final candidate = RTCIceCandidate(
+          candidateMap['candidate'],
+          candidateMap['sdpMid'],
+          candidateMap['sdpMLineIndex'],
         );
+        if (_peerConnection != null) {
+          await _peerConnection!.addCandidate(candidate);
+        } else {
+          _queuedCandidates.add(candidate);
+          debugPrint("Queued ICE candidate because PeerConnection is not ready.");
+        }
         break;
 
       case 'leave':
@@ -286,7 +299,7 @@ class WebRTCService extends ChangeNotifier {
         'autoGainControl': false,
         'echoCancellation': false,
         'channelCount': 2,
-        if (_selectedAudioInputId != null) 'deviceId': {'exact': _selectedAudioInputId},
+        if (_selectedAudioInputId != null && _selectedAudioInputId!.isNotEmpty) 'deviceId': _selectedAudioInputId,
       },
       'video': {
         'facingMode': 'user',
@@ -301,7 +314,47 @@ class WebRTCService extends ChangeNotifier {
       _localRenderer!.srcObject = _localStream;
       notifyListeners();
     } catch (e) {
-      debugPrint("Camera/Microphone capture failed: $e");
+      debugPrint("Camera/Microphone capture failed with ideal constraints: $e. Retrying with fallback constraints...");
+      try {
+        final Map<String, dynamic> fallbackConstraints = {
+          'audio': {
+            'noiseSuppression': false,
+            'autoGainControl': false,
+            'echoCancellation': false,
+            if (_selectedAudioInputId != null && _selectedAudioInputId!.isNotEmpty) 'deviceId': _selectedAudioInputId,
+          },
+          'video': {
+            'facingMode': 'user',
+          },
+        };
+        _localStream = await navigator.mediaDevices.getUserMedia(fallbackConstraints);
+        _localRenderer!.srcObject = _localStream;
+        notifyListeners();
+      } catch (e2) {
+        debugPrint("Fallback media capture also failed: $e2. Retrying with default audio and video constraints...");
+        try {
+          final Map<String, dynamic> defaultConstraints = {
+            'audio': true,
+            'video': true,
+          };
+          _localStream = await navigator.mediaDevices.getUserMedia(defaultConstraints);
+          _localRenderer!.srcObject = _localStream;
+          notifyListeners();
+        } catch (e3) {
+          debugPrint("Default audio/video capture failed: $e3. Retrying with audio-only...");
+          try {
+            final Map<String, dynamic> audioOnlyConstraints = {
+              'audio': true,
+              'video': false,
+            };
+            _localStream = await navigator.mediaDevices.getUserMedia(audioOnlyConstraints);
+            _localRenderer!.srcObject = _localStream;
+            notifyListeners();
+          } catch (e4) {
+            debugPrint("All media capture attempts failed: $e4");
+          }
+        }
+      }
     }
   }
 
@@ -350,6 +403,7 @@ class WebRTCService extends ChangeNotifier {
     };
 
     _peerConnection = await createPeerConnection(config, {});
+    await _processQueuedCandidates();
 
     if (_localStream != null) {
       _localStream!.getTracks().forEach((track) {
@@ -386,6 +440,7 @@ class WebRTCService extends ChangeNotifier {
       if (existingIndex != -1) {
         final existing = _remoteParticipants[existingIndex];
         existing.stream.addTrack(event.track);
+        existing.renderer.srcObject = null;
         existing.renderer.srcObject = existing.stream;
         notifyListeners();
       } else {
@@ -427,6 +482,7 @@ class WebRTCService extends ChangeNotifier {
     };
 
     _peerConnection = await createPeerConnection(config, {});
+    await _processQueuedCandidates();
 
     if (_localStream != null) {
       _localStream!.getTracks().forEach((track) {
@@ -458,6 +514,7 @@ class WebRTCService extends ChangeNotifier {
       if (existingIndex != -1) {
         final existing = _remoteParticipants[existingIndex];
         existing.stream.addTrack(event.track);
+        existing.renderer.srcObject = null;
         existing.renderer.srcObject = existing.stream;
         notifyListeners();
       } else {
@@ -541,6 +598,19 @@ class WebRTCService extends ChangeNotifier {
     }
   }
 
+  Future<void> _processQueuedCandidates() async {
+    if (_peerConnection == null) return;
+    debugPrint("Processing ${_queuedCandidates.length} queued ICE candidates.");
+    for (var candidate in _queuedCandidates) {
+      try {
+        await _peerConnection!.addCandidate(candidate);
+      } catch (e) {
+        debugPrint("Error adding queued candidate: $e");
+      }
+    }
+    _queuedCandidates.clear();
+  }
+
   // Leave room and clean up
   Future<void> leave() async {
     _cleanup();
@@ -556,6 +626,8 @@ class WebRTCService extends ChangeNotifier {
     _myUserId = null;
     _p2pPartnerId = null;
     _p2pPartnerName = null;
+    _queuedCandidates.clear();
+    _localStreamFuture = null;
 
     for (var p in _remoteParticipants) {
       p.dispose();
