@@ -570,47 +570,61 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.all(16.0),
-                  child: _pinnedParticipantId == null
-                      ? GridView.builder(
-                          itemCount: service.remoteParticipants.length + 1, // +1 for local
-                          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                            maxCrossAxisExtent: 320,
-                            crossAxisSpacing: 16,
-                            mainAxisSpacing: 16,
-                            childAspectRatio: 1.2,
-                          ),
-                          itemBuilder: (context, index) {
-                            if (index == 0) {
-                              return _buildLocalParticipantVideo(service, isSmall: false);
-                            }
-                            final p = service.remoteParticipants[index - 1];
-                            return _buildRemoteParticipantVideo(service, p, isSmall: false);
-                          },
-                        )
-                      : Column(
-                          children: [
-                            // Pinned large video
-                            Expanded(
-                              flex: 5,
-                              child: Container(
-                                decoration: BoxDecoration(
-                                  borderRadius: BorderRadius.circular(16),
-                                  border: Border.all(color: const Color(0xFF262438), width: 1.5),
-                                ),
-                                child: _buildPinnedVideo(service),
-                              ),
-                            ),
-                            const SizedBox(height: 16),
-                            // Horizontal non-pinned row
-                            SizedBox(
-                              height: 120,
-                              child: ListView(
-                                scrollDirection: Axis.horizontal,
-                                children: _buildNonPinnedVideos(service),
-                              ),
-                            ),
-                          ],
+                  child: () {
+                    final remoteParticipants = service.remoteParticipants;
+                    // Auto-focus first guest if layout hasn't been set yet
+                    if (_pinnedParticipantId == null && remoteParticipants.isNotEmpty) {
+                      _pinnedParticipantId = remoteParticipants.first.userId;
+                    }
+
+                    final bool isPinnedLayout = _pinnedParticipantId != null &&
+                        _pinnedParticipantId != 'grid' &&
+                        remoteParticipants.isNotEmpty;
+
+                    if (!isPinnedLayout) {
+                      return GridView.builder(
+                        itemCount: service.remoteParticipants.length + 1, // +1 for local
+                        gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                          maxCrossAxisExtent: 320,
+                          crossAxisSpacing: 16,
+                          mainAxisSpacing: 16,
+                          childAspectRatio: 1.2,
                         ),
+                        itemBuilder: (context, index) {
+                          if (index == 0) {
+                            return _buildLocalParticipantVideo(service, isSmall: false);
+                          }
+                          final p = service.remoteParticipants[index - 1];
+                          return _buildRemoteParticipantVideo(service, p, isSmall: false);
+                        },
+                      );
+                    } else {
+                      return Column(
+                        children: [
+                          // Pinned large video
+                          Expanded(
+                            flex: 5,
+                            child: Container(
+                              decoration: BoxDecoration(
+                                borderRadius: BorderRadius.circular(16),
+                                border: Border.all(color: const Color(0xFF262438), width: 1.5),
+                              ),
+                              child: _buildPinnedVideo(service),
+                            ),
+                          ),
+                          const SizedBox(height: 16),
+                          // Horizontal non-pinned row
+                          SizedBox(
+                            height: 120,
+                            child: ListView(
+                              scrollDirection: Axis.horizontal,
+                              children: _buildNonPinnedVideos(service),
+                            ),
+                          ),
+                        ],
+                      );
+                    }
+                  }(),
                 ),
               ),
 
@@ -732,7 +746,7 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                         if (val == 'pin') {
                           _pinnedParticipantId = 'local';
                         } else if (val == 'unpin') {
-                          _pinnedParticipantId = null;
+                          _pinnedParticipantId = 'grid';
                         }
                       });
                     },
@@ -833,7 +847,7 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                         if (val == 'pin') {
                           _pinnedParticipantId = p.userId;
                         } else if (val == 'unpin') {
-                          _pinnedParticipantId = null;
+                          _pinnedParticipantId = 'grid';
                         }
                       });
                     },
