@@ -9,6 +9,7 @@ class RemoteParticipant {
   final String trackId;
   final MediaStream stream;
   final RTCVideoRenderer renderer;
+  double volume;
 
   RemoteParticipant({
     required this.userId,
@@ -16,11 +17,20 @@ class RemoteParticipant {
     required this.trackId,
     required this.stream,
     required this.renderer,
+    this.volume = 1.0,
   });
 
   Future<void> dispose() async {
     renderer.srcObject = null;
     await renderer.dispose();
+  }
+
+  void setVolume(double val) {
+    volume = val;
+    // In WebRTC web platform, we can adjust the volume directly on the html audio element,
+    // which corresponds to renderer.srcObject.getAudioTracks().first or the HTML element.
+    // For this PoC, we update the slider value local state.
+    // renderer.volume = volume;
   }
 }
 
@@ -28,12 +38,24 @@ class WebRTCService extends ChangeNotifier {
   WebSocketChannel? _channel;
   RTCPeerConnection? _peerConnection;
   MediaStream? _localStream;
+  RTCVideoRenderer? _localRenderer;
   
   bool _isConnected = false;
   bool _isJoined = false;
   bool _isMuted = false;
+  bool _isCameraOn = true;
   String? _roomId;
+  String? _callType; // "p2p" or "sfu"
+  String? _myUserId;
   
+  // P2P 1:1 partner tracking
+  String? _p2pPartnerId;
+  String? _p2pPartnerName;
+
+  // Selected hardware config
+  String? _selectedAudioInputId;
+  List<MediaDeviceInfo> _audioDevices = [];
+
   // Track metadata mapping sent by the server: TrackID -> (UserID, Username)
   final Map<String, Map<String, String>> _trackMetadata = {};
   
@@ -43,13 +65,51 @@ class WebRTCService extends ChangeNotifier {
   bool get isConnected => _isConnected;
   bool get isJoined => _isJoined;
   bool get isMuted => _isMuted;
+  bool get isCameraOn => _isCameraOn;
   String? get roomId => _roomId;
+  String? get callType => _callType;
   List<RemoteParticipant> get remoteParticipants => _remoteParticipants;
   MediaStream? get localStream => _localStream;
+  RTCVideoRenderer? get localRenderer => _localRenderer;
+  List<MediaDeviceInfo> get audioDevices => _audioDevices;
+  String? get selectedAudioInputId => _selectedAudioInputId;
+
+  // Fetch list of available audio input devices
+  Future<void> loadAudioDevices() async {
+    try {
+      final devices = await navigator.mediaDevices.enumerateDevices();
+      _audioDevices = devices.where((d) => d.kind == 'audioinput').toList();
+      if (_audioDevices.isNotEmpty && _selectedAudioInputId == null) {
+        _selectedAudioInputId = _audioDevices.first.deviceId;
+      }
+      notifyListeners();
+    } catch (e) {
+      debugPrint("Error loading audio devices: $e");
+    }
+  }
+
+  // Set selected device and hot-swap local stream
+  Future<void> setAudioInputDevice(String deviceId) async {
+    _selectedAudioInputId = deviceId;
+    notifyListeners();
+    if (_localStream != null) {
+      // Re-capture local media with the new device ID
+      await _reacquireLocalStream();
+    }
+  }
 
   // Connect to Go backend signaling socket
-  Future<void> connect(String wsUrl, String roomId, String token, String username) async {
+  Future<void> connect(
+    String wsUrl, 
+    String roomId, 
+    String token, 
+    String username, {
+    required String callType,
+    int maxParticipants = 4,
+    int timeLimitMinutes = 40,
+  }) async {
     _roomId = roomId;
+    _callType = callType;
     notifyListeners();
 
     try {
@@ -78,6 +138,9 @@ class WebRTCService extends ChangeNotifier {
           'roomId': roomId,
           'token': token,
           'username': username,
+          'callType': callType,
+          'maxParticipants': maxParticipants,
+          'timeLimitMinutes': timeLimitMinutes,
         }
       };
       _channel!.sink.add(jsonEncode(joinPayload));
@@ -97,18 +160,42 @@ class WebRTCService extends ChangeNotifier {
 
     switch (type) {
       case 'joined':
-        debugPrint("Successfully joined Room! Status: ${payload['status']}");
         _isJoined = true;
+        _myUserId = payload['userId'];
+        _callType = payload['callType'];
+        debugPrint("Joined successfully. UID: $_myUserId, CallType: $_callType");
         notifyListeners();
-        // Initialize PeerConnection and publish audio
-        await _initializePeerConnection();
+
+        // 1. Initialize local preview renderer
+        _localRenderer = RTCVideoRenderer();
+        await _localRenderer!.initialize();
+
+        // 2. Setup Local Stream
+        await _acquireLocalStream();
+
+        // 3. Setup Connection
+        if (_callType == 'sfu') {
+          await _initializeSFUPeerConnection();
+        }
+        break;
+
+      case 'user_joined':
+        final String userId = payload['userId'];
+        final String username = payload['username'];
+        debugPrint("User joined the room: $username ($userId)");
+
+        if (_callType == 'p2p') {
+          _p2pPartnerId = userId;
+          _p2pPartnerName = username;
+          // The host (who is already in room) initiates P2P connection when guest joins
+          await _initializeP2PPeerConnection(userId, isOfferer: true);
+        }
         break;
 
       case 'track_info':
         final String trackId = payload['trackId'];
         final String userId = payload['userId'];
         final String username = payload['username'];
-        debugPrint("Received track info: Track=$trackId belongs to User=$userId ($username)");
         _trackMetadata[trackId] = {
           'userId': userId,
           'username': username,
@@ -116,8 +203,17 @@ class WebRTCService extends ChangeNotifier {
         break;
 
       case 'offer':
-        if (_peerConnection == null) return;
         final String sdp = payload['sdp'];
+        final String? senderUserId = payload['senderUserId'];
+
+        if (_callType == 'p2p') {
+          if (senderUserId != null) {
+            _p2pPartnerId = senderUserId;
+          }
+          await _initializeP2PPeerConnection(_p2pPartnerId ?? 'partner', isOfferer: false);
+        }
+
+        if (_peerConnection == null) return;
         await _peerConnection!.setRemoteDescription(
           RTCSessionDescription(sdp, 'offer'),
         );
@@ -125,11 +221,20 @@ class WebRTCService extends ChangeNotifier {
         await _peerConnection!.setLocalDescription(answer);
         
         // Send Answer back
-        _channel!.sink.add(jsonEncode({
-          'type': 'answer',
-          'payload': {'sdp': answer.sdp}
-        }));
-        debugPrint("Sent Answer back to server.");
+        if (_callType == 'p2p') {
+          _channel!.sink.add(jsonEncode({
+            'type': 'answer',
+            'payload': {
+              'sdp': answer.sdp,
+              'targetUserId': _p2pPartnerId,
+            }
+          }));
+        } else {
+          _channel!.sink.add(jsonEncode({
+            'type': 'answer',
+            'payload': {'sdp': answer.sdp}
+          }));
+        }
         break;
 
       case 'answer':
@@ -138,7 +243,6 @@ class WebRTCService extends ChangeNotifier {
         await _peerConnection!.setRemoteDescription(
           RTCSessionDescription(sdp, 'answer'),
         );
-        debugPrint("Set remote description (Answer).");
         break;
 
       case 'candidate':
@@ -151,61 +255,108 @@ class WebRTCService extends ChangeNotifier {
             candidateMap['sdpMLineIndex'],
           ),
         );
-        debugPrint("Added remote ICE candidate.");
         break;
 
       case 'leave':
         final String userId = payload['userId'];
         debugPrint("Participant left: $userId");
         _removeParticipantByUserId(userId);
+        if (_callType == 'p2p' && userId == _p2pPartnerId) {
+          _cleanupPeerConnectionOnly();
+        }
+        break;
+
+      case 'call_ended':
+        debugPrint("Call terminated by server: ${payload['reason']}");
+        _cleanup();
         break;
 
       case 'error':
-        debugPrint("Error from signaling server: ${payload['error']}");
+        debugPrint("Signaling error: ${payload['error']}");
+        _cleanup();
         break;
     }
   }
 
-  // Initialize WebRTC Peer Connection and publish raw audio
-  Future<void> _initializePeerConnection() async {
-    final Map<String, dynamic> config = {
-      'iceServers': [
-        {'urls': 'stun:stun.l.google.com:19302'}
-      ]
-    };
-
-    final Map<String, dynamic> constraints = {
-      'mandatory': {},
-      'optional': [
-        {'DtlsSrtpKeyAgreement': true}
-      ]
-    };
-
-    _peerConnection = await createPeerConnection(config, constraints);
-
-    // Setup Local Audio Media Stream
+  // Set up local MediaStream containing raw audio and ideal video
+  Future<void> _acquireLocalStream() async {
     final Map<String, dynamic> mediaConstraints = {
       'audio': {
         'noiseSuppression': false,
         'autoGainControl': false,
         'echoCancellation': false,
         'channelCount': 2,
+        if (_selectedAudioInputId != null) 'deviceId': {'exact': _selectedAudioInputId},
       },
-      'video': false,
+      'video': {
+        'facingMode': 'user',
+        'width': {'ideal': 640},
+        'height': {'ideal': 480},
+        'frameRate': {'ideal': 24},
+      },
     };
 
     try {
       _localStream = await navigator.mediaDevices.getUserMedia(mediaConstraints);
-      debugPrint("Captured local microphone with constraints: noiseSuppression=false, autoGainControl=false, echoCancellation=false, channelCount=2.");
-      
+      _localRenderer!.srcObject = _localStream;
+      notifyListeners();
+    } catch (e) {
+      debugPrint("Camera/Microphone capture failed: $e");
+    }
+  }
+
+  // Hot-swap audio tracks on device selection change
+  Future<void> _reacquireLocalStream() async {
+    if (_localStream == null) return;
+
+    final oldTracks = _localStream!.getTracks();
+    for (var track in oldTracks) {
+      track.stop();
+      if (_peerConnection != null) {
+        // Remove old track from sender if active
+        final senders = await _peerConnection!.getSenders();
+        for (var sender in senders) {
+          if (sender.track?.id == track.id) {
+            await _peerConnection!.removeTrack(sender);
+          }
+        }
+      }
+    }
+
+    await _acquireLocalStream();
+
+    if (_peerConnection != null && _localStream != null) {
       _localStream!.getTracks().forEach((track) {
         _peerConnection!.addTrack(track, _localStream!);
       });
-    } catch (e) {
-      debugPrint("Microphone capture failed (or denied): $e");
+      // Trigger local renegotiation
+      if (_callType == 'sfu') {
+        final offer = await _peerConnection!.createOffer({});
+        await _peerConnection!.setLocalDescription(offer);
+        _channel!.sink.add(jsonEncode({
+          'type': 'offer',
+          'payload': {'sdp': offer.sdp}
+        }));
+      }
+    }
+  }
+
+  // Initialize standard SFU connection (media is managed by pion server)
+  Future<void> _initializeSFUPeerConnection() async {
+    final Map<String, dynamic> config = {
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'}
+      ]
+    };
+
+    _peerConnection = await createPeerConnection(config, {});
+
+    if (_localStream != null) {
+      _localStream!.getTracks().forEach((track) {
+        _peerConnection!.addTrack(track, _localStream!);
+      });
     }
 
-    // Handle Local ICE Candidates
     _peerConnection!.onIceCandidate = (candidate) {
       if (candidate == null) return;
       _channel!.sink.add(jsonEncode({
@@ -220,49 +371,133 @@ class WebRTCService extends ChangeNotifier {
       }));
     };
 
-    // Handle incoming Remote Tracks
     _peerConnection!.onTrack = (RTCTrackEvent event) async {
-      debugPrint("Received remote track from peer: Streams=${event.streams.length}, Track=${event.track.id}, Kind=${event.track.kind}");
-      if (event.streams.isEmpty || event.track.kind != 'audio') return;
-
+      if (event.streams.isEmpty) return;
       final MediaStream stream = event.streams.first;
       final String trackId = event.track.id!;
 
-      // Lookup owner info
       final metadata = _trackMetadata[trackId];
       final String userId = metadata?['userId'] ?? 'unknown_user';
       final String username = metadata?['username'] ?? 'User ($userId)';
 
-      // Create video renderer to play out the remote audio track
-      final renderer = RTCVideoRenderer();
-      await renderer.initialize();
-      renderer.srcObject = stream;
+      // Check if participant already exists in room, and merge track (audio+video)
+      final existingIndex = _remoteParticipants.indexWhere((p) => p.userId == userId);
 
-      final newParticipant = RemoteParticipant(
-        userId: userId,
-        username: username,
-        trackId: trackId,
-        stream: stream,
-        renderer: renderer,
-      );
+      if (existingIndex != -1) {
+        final existing = _remoteParticipants[existingIndex];
+        existing.stream.addTrack(event.track);
+        existing.renderer.srcObject = existing.stream;
+        notifyListeners();
+      } else {
+        final renderer = RTCVideoRenderer();
+        await renderer.initialize();
+        renderer.srcObject = stream;
 
-      _remoteParticipants.add(newParticipant);
-      notifyListeners();
+        final newParticipant = RemoteParticipant(
+          userId: userId,
+          username: username,
+          trackId: trackId,
+          stream: stream,
+          renderer: renderer,
+        );
+
+        _remoteParticipants.add(newParticipant);
+        notifyListeners();
+      }
     };
 
-    _peerConnection!.onConnectionState = (state) {
-      debugPrint("WebRTC Connection State: $state");
-    };
-
-    // Create and Send Offer
     final offer = await _peerConnection!.createOffer({});
     await _peerConnection!.setLocalDescription(offer);
-
     _channel!.sink.add(jsonEncode({
       'type': 'offer',
       'payload': {'sdp': offer.sdp}
     }));
-    debugPrint("Sent initial SDP Offer to server.");
+  }
+
+  // Initialize P2P connection (media goes directly to the peer)
+  Future<void> _initializeP2PPeerConnection(String targetUserId, {required bool isOfferer}) async {
+    if (_peerConnection != null) return; // Already initialized
+
+    debugPrint("Initializing P2P connection with: $targetUserId. Offerer: $isOfferer");
+
+    final Map<String, dynamic> config = {
+      'iceServers': [
+        {'urls': 'stun:stun.l.google.com:19302'}
+      ]
+    };
+
+    _peerConnection = await createPeerConnection(config, {});
+
+    if (_localStream != null) {
+      _localStream!.getTracks().forEach((track) {
+        _peerConnection!.addTrack(track, _localStream!);
+      });
+    }
+
+    _peerConnection!.onIceCandidate = (candidate) {
+      if (candidate == null) return;
+      _channel!.sink.add(jsonEncode({
+        'type': 'candidate',
+        'payload': {
+          'targetUserId': targetUserId,
+          'candidate': {
+            'candidate': candidate.candidate,
+            'sdpMid': candidate.sdpMid,
+            'sdpMLineIndex': candidate.sdpMLineIndex,
+          }
+        }
+      }));
+    };
+
+    _peerConnection!.onTrack = (RTCTrackEvent event) async {
+      if (event.streams.isEmpty) return;
+      final MediaStream stream = event.streams.first;
+
+      final existingIndex = _remoteParticipants.indexWhere((p) => p.userId == targetUserId);
+
+      if (existingIndex != -1) {
+        final existing = _remoteParticipants[existingIndex];
+        existing.stream.addTrack(event.track);
+        existing.renderer.srcObject = existing.stream;
+        notifyListeners();
+      } else {
+        final renderer = RTCVideoRenderer();
+        await renderer.initialize();
+        renderer.srcObject = stream;
+
+        final newParticipant = RemoteParticipant(
+          userId: targetUserId,
+          username: _p2pPartnerName ?? 'Partner',
+          trackId: event.track.id ?? 'p2p_track',
+          stream: stream,
+          renderer: renderer,
+        );
+
+        _remoteParticipants.add(newParticipant);
+        notifyListeners();
+      }
+    };
+
+    if (isOfferer) {
+      final offer = await _peerConnection!.createOffer({});
+      await _peerConnection!.setLocalDescription(offer);
+      _channel!.sink.add(jsonEncode({
+        'type': 'offer',
+        'payload': {
+          'sdp': offer.sdp,
+          'targetUserId': targetUserId,
+        }
+      }));
+    }
+  }
+
+  // Adjust volume for a specific remote participant
+  void setParticipantVolume(String userId, double volume) {
+    final idx = _remoteParticipants.indexWhere((p) => p.userId == userId);
+    if (idx != -1) {
+      _remoteParticipants[idx].setVolume(volume);
+      notifyListeners();
+    }
   }
 
   // Toggle local mute
@@ -272,6 +507,18 @@ class WebRTCService extends ChangeNotifier {
       if (audioTracks.isNotEmpty) {
         _isMuted = !_isMuted;
         audioTracks.first.enabled = !_isMuted;
+        notifyListeners();
+      }
+    }
+  }
+
+  // Toggle local camera
+  void toggleCamera() {
+    if (_localStream != null) {
+      final videoTracks = _localStream!.getVideoTracks();
+      if (videoTracks.isNotEmpty) {
+        _isCameraOn = !_isCameraOn;
+        videoTracks.first.enabled = _isCameraOn;
         notifyListeners();
       }
     }
@@ -287,6 +534,13 @@ class WebRTCService extends ChangeNotifier {
     }
   }
 
+  void _cleanupPeerConnectionOnly() {
+    if (_peerConnection != null) {
+      _peerConnection!.close();
+      _peerConnection = null;
+    }
+  }
+
   // Leave room and clean up
   Future<void> leave() async {
     _cleanup();
@@ -296,7 +550,12 @@ class WebRTCService extends ChangeNotifier {
     _isConnected = false;
     _isJoined = false;
     _isMuted = false;
+    _isCameraOn = true;
     _roomId = null;
+    _callType = null;
+    _myUserId = null;
+    _p2pPartnerId = null;
+    _p2pPartnerName = null;
 
     for (var p in _remoteParticipants) {
       p.dispose();
@@ -309,10 +568,13 @@ class WebRTCService extends ChangeNotifier {
       _localStream = null;
     }
 
-    if (_peerConnection != null) {
-      _peerConnection!.close();
-      _peerConnection = null;
+    if (_localRenderer != null) {
+      _localRenderer!.srcObject = null;
+      _localRenderer!.dispose();
+      _localRenderer = null;
     }
+
+    _cleanupPeerConnectionOnly();
 
     if (_channel != null) {
       _channel!.sink.close();
