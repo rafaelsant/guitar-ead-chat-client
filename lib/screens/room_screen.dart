@@ -39,6 +39,9 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
   Timer? _sessionCountdownTimer;
   int _secondsRemaining = 0;
 
+  // Focus layout: active pinned participant ID
+  String? _pinnedParticipantId;
+
   @override
   void initState() {
     super.initState();
@@ -384,7 +387,9 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                 avatar: CircleAvatar(
                   backgroundColor: const Color(0xFF8B5CF6),
                   child: Text(
-                    auth.currentUser!.displayName.substring(0, 1).toUpperCase(),
+                    auth.currentUser!.displayName.isNotEmpty
+                        ? auth.currentUser!.displayName.substring(0, 1).toUpperCase()
+                        : "?",
                     style: const TextStyle(color: Colors.white, fontSize: 12),
                   ),
                 ),
@@ -561,29 +566,51 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                 ),
               ),
 
-              // Render Grid of Participant Videos
+              // Render Grid of Participant Videos or Pinned View
               Expanded(
                 child: Padding(
                   padding: const EdgeInsets.all(16.0),
-                  child: GridView.builder(
-                    itemCount: service.remoteParticipants.length + 1, // +1 for local
-                    gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
-                      maxCrossAxisExtent: 320,
-                      crossAxisSpacing: 16,
-                      mainAxisSpacing: 16,
-                      childAspectRatio: 1.2,
-                    ),
-                    itemBuilder: (context, index) {
-                      if (index == 0) {
-                        // Local View
-                        return _buildLocalParticipantVideo(service);
-                      }
-
-                      // Remote View
-                      final p = service.remoteParticipants[index - 1];
-                      return _buildRemoteParticipantVideo(service, p);
-                    },
-                  ),
+                  child: _pinnedParticipantId == null
+                      ? GridView.builder(
+                          itemCount: service.remoteParticipants.length + 1, // +1 for local
+                          gridDelegate: const SliverGridDelegateWithMaxCrossAxisExtent(
+                            maxCrossAxisExtent: 320,
+                            crossAxisSpacing: 16,
+                            mainAxisSpacing: 16,
+                            childAspectRatio: 1.2,
+                          ),
+                          itemBuilder: (context, index) {
+                            if (index == 0) {
+                              return _buildLocalParticipantVideo(service, isSmall: false);
+                            }
+                            final p = service.remoteParticipants[index - 1];
+                            return _buildRemoteParticipantVideo(service, p, isSmall: false);
+                          },
+                        )
+                      : Column(
+                          children: [
+                            // Pinned large video
+                            Expanded(
+                              flex: 5,
+                              child: Container(
+                                decoration: BoxDecoration(
+                                  borderRadius: BorderRadius.circular(16),
+                                  border: Border.all(color: const Color(0xFF262438), width: 1.5),
+                                ),
+                                child: _buildPinnedVideo(service),
+                              ),
+                            ),
+                            const SizedBox(height: 16),
+                            // Horizontal non-pinned row
+                            SizedBox(
+                              height: 120,
+                              child: ListView(
+                                scrollDirection: Axis.horizontal,
+                                children: _buildNonPinnedVideos(service),
+                              ),
+                            ),
+                          ],
+                        ),
                 ),
               ),
 
@@ -621,21 +648,24 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                       final name = req['displayName'];
                       final email = req['email'];
 
-                      return ListTile(
-                        title: Text(name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
-                        subtitle: Text(email, style: const TextStyle(color: Colors.white54, fontSize: 11)),
-                        trailing: Row(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            IconButton(
-                              icon: const Icon(Icons.check_circle, color: Color(0xFF10B981)),
-                              onPressed: () => _acceptParticipant(uid, name, email),
-                            ),
-                            IconButton(
-                              icon: const Icon(Icons.cancel, color: Color(0xFFEF4444)),
-                              onPressed: () => _denyParticipant(uid, name, email),
-                            ),
-                          ],
+                      return Material(
+                        color: Colors.transparent,
+                        child: ListTile(
+                          title: Text(name, style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600)),
+                          subtitle: Text(email, style: const TextStyle(color: Colors.white54, fontSize: 11)),
+                          trailing: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              IconButton(
+                                icon: const Icon(Icons.check_circle, color: Color(0xFF10B981)),
+                                onPressed: () => _acceptParticipant(uid, name, email),
+                              ),
+                              IconButton(
+                                icon: const Icon(Icons.cancel, color: Color(0xFFEF4444)),
+                                onPressed: () => _denyParticipant(uid, name, email),
+                              ),
+                            ],
+                          ),
                         ),
                       );
                     },
@@ -649,7 +679,7 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
   }
 
   // Local Video Card
-  Widget _buildLocalParticipantVideo(WebRTCService service) {
+  Widget _buildLocalParticipantVideo(WebRTCService service, {bool isSmall = false}) {
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF1E1C2E),
@@ -664,23 +694,61 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                 ? RTCVideoView(service.localRenderer!, objectFit: RTCVideoViewObjectFit.RTCVideoViewObjectFitCover)
                 : Container(
                     color: const Color(0xFF1A1829),
-                    child: const Center(
-                      child: Icon(Icons.videocam_off, color: Colors.white38, size: 48),
+                    child: Center(
+                      child: Icon(Icons.videocam_off, color: Colors.white38, size: isSmall ? 28 : 48),
                     ),
                   ),
             // Info tag overlay
             Positioned(
-              bottom: 12,
-              left: 12,
+              bottom: isSmall ? 6 : 12,
+              left: isSmall ? 6 : 12,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                padding: EdgeInsets.symmetric(horizontal: isSmall ? 6 : 8, vertical: isSmall ? 2 : 4),
                 decoration: BoxDecoration(
                   color: Colors.black.withOpacity(0.6),
                   borderRadius: BorderRadius.circular(6),
                 ),
                 child: Text(
                   "You ${service.isMuted ? '(Muted)' : ''}",
-                  style: const TextStyle(color: Colors.white, fontSize: 11, fontWeight: FontWeight.bold),
+                  style: TextStyle(color: Colors.white, fontSize: isSmall ? 9 : 11, fontWeight: FontWeight.bold),
+                ),
+              ),
+            ),
+            // Focus options menu
+            Positioned(
+              top: isSmall ? 4 : 8,
+              right: isSmall ? 4 : 8,
+              child: ClipOval(
+                child: Material(
+                  color: Colors.black.withOpacity(0.6),
+                  child: PopupMenuButton<String>(
+                    icon: Icon(Icons.more_vert, color: Colors.white, size: isSmall ? 16 : 20),
+                    padding: isSmall ? const EdgeInsets.all(4) : const EdgeInsets.all(8),
+                    constraints: isSmall ? const BoxConstraints(minWidth: 32, minHeight: 32) : null,
+                    tooltip: "Options",
+                    color: const Color(0xFF1E1C2E),
+                    onSelected: (val) {
+                      setState(() {
+                        if (val == 'pin') {
+                          _pinnedParticipantId = 'local';
+                        } else if (val == 'unpin') {
+                          _pinnedParticipantId = null;
+                        }
+                      });
+                    },
+                    itemBuilder: (context) => [
+                      if (_pinnedParticipantId == 'local')
+                        const PopupMenuItem(
+                          value: 'unpin',
+                          child: Text("Unfocus Local Video", style: TextStyle(color: Colors.white, fontSize: 13)),
+                        )
+                      else
+                        const PopupMenuItem(
+                          value: 'pin',
+                          child: Text("Focus Local Video", style: TextStyle(color: Colors.white, fontSize: 13)),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -691,7 +759,7 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
   }
 
   // Remote Video Card (with individual volume controls)
-  Widget _buildRemoteParticipantVideo(WebRTCService service, RemoteParticipant p) {
+  Widget _buildRemoteParticipantVideo(WebRTCService service, RemoteParticipant p, {bool isSmall = false}) {
     return Container(
       decoration: BoxDecoration(
         color: const Color(0xFF1E1C2E),
@@ -709,7 +777,7 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
               left: 0,
               right: 0,
               child: Container(
-                padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                padding: EdgeInsets.symmetric(horizontal: isSmall ? 8 : 12, vertical: isSmall ? 4 : 8),
                 color: Colors.black.withOpacity(0.6),
                 child: Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
@@ -719,28 +787,69 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                         p.username,
                         maxLines: 1,
                         overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(color: Colors.white, fontSize: 12, fontWeight: FontWeight.bold),
+                        style: TextStyle(color: Colors.white, fontSize: isSmall ? 9 : 12, fontWeight: FontWeight.bold),
                       ),
                     ),
-                    Row(
-                      children: [
-                        const Icon(Icons.volume_up, color: Colors.white70, size: 14),
-                        SizedBox(
-                          width: 80,
-                          height: 20,
-                          child: Slider(
-                            value: p.volume,
-                            min: 0.0,
-                            max: 1.0,
-                            activeColor: const Color(0xFF8B5CF6),
-                            onChanged: (val) {
-                              service.setParticipantVolume(p.userId, val);
-                            },
+                    if (!isSmall) ...[
+                      Row(
+                        children: [
+                          const Icon(Icons.volume_up, color: Colors.white70, size: 14),
+                          SizedBox(
+                            width: 80,
+                            height: 20,
+                            child: Slider(
+                              value: p.volume,
+                              min: 0.0,
+                              max: 1.0,
+                              activeColor: const Color(0xFF8B5CF6),
+                              onChanged: (val) {
+                                service.setParticipantVolume(p.userId, val);
+                              },
+                            ),
                           ),
-                        ),
-                      ],
-                    ),
+                        ],
+                      ),
+                    ] else
+                      Icon(p.volume == 0 ? Icons.volume_off : Icons.volume_up, color: Colors.white70, size: 12),
                   ],
+                ),
+              ),
+            ),
+            // Focus options menu
+            Positioned(
+              top: isSmall ? 4 : 8,
+              right: isSmall ? 4 : 8,
+              child: ClipOval(
+                child: Material(
+                  color: Colors.black.withOpacity(0.6),
+                  child: PopupMenuButton<String>(
+                    icon: Icon(Icons.more_vert, color: Colors.white, size: isSmall ? 16 : 20),
+                    padding: isSmall ? const EdgeInsets.all(4) : const EdgeInsets.all(8),
+                    constraints: isSmall ? const BoxConstraints(minWidth: 32, minHeight: 32) : null,
+                    tooltip: "Options",
+                    color: const Color(0xFF1E1C2E),
+                    onSelected: (val) {
+                      setState(() {
+                        if (val == 'pin') {
+                          _pinnedParticipantId = p.userId;
+                        } else if (val == 'unpin') {
+                          _pinnedParticipantId = null;
+                        }
+                      });
+                    },
+                    itemBuilder: (context) => [
+                      if (_pinnedParticipantId == p.userId)
+                        const PopupMenuItem(
+                          value: 'unpin',
+                          child: Text("Unfocus Video", style: TextStyle(color: Colors.white, fontSize: 13)),
+                        )
+                      else
+                        const PopupMenuItem(
+                          value: 'pin',
+                          child: Text("Focus Video", style: TextStyle(color: Colors.white, fontSize: 13)),
+                        ),
+                    ],
+                  ),
                 ),
               ),
             ),
@@ -748,6 +857,59 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
         ),
       ),
     );
+  }
+
+  Widget _buildPinnedVideo(WebRTCService service) {
+    if (_pinnedParticipantId == 'local') {
+      return _buildLocalParticipantVideo(service, isSmall: false);
+    }
+    
+    final pIndex = service.remoteParticipants.indexWhere((p) => p.userId == _pinnedParticipantId);
+    if (pIndex != -1) {
+      return _buildRemoteParticipantVideo(service, service.remoteParticipants[pIndex], isSmall: false);
+    }
+    
+    // Fallback if pinned participant disconnected
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      setState(() {
+        _pinnedParticipantId = null;
+      });
+    });
+    return _buildLocalParticipantVideo(service, isSmall: false);
+  }
+
+  List<Widget> _buildNonPinnedVideos(WebRTCService service) {
+    final List<Widget> list = [];
+    
+    // Check if local is not pinned
+    if (_pinnedParticipantId != 'local') {
+      list.add(
+        Padding(
+          padding: const EdgeInsets.only(right: 12),
+          child: AspectRatio(
+            aspectRatio: 1.2,
+            child: _buildLocalParticipantVideo(service, isSmall: true),
+          ),
+        ),
+      );
+    }
+    
+    // Add non-pinned remote participants
+    for (var p in service.remoteParticipants) {
+      if (p.userId != _pinnedParticipantId) {
+        list.add(
+          Padding(
+            padding: const EdgeInsets.only(right: 12),
+            child: AspectRatio(
+              aspectRatio: 1.2,
+              child: _buildRemoteParticipantVideo(service, p, isSmall: true),
+            ),
+          ),
+        );
+      }
+    }
+    
+    return list;
   }
 
   // Call dashboard controls
@@ -786,7 +948,9 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                     return DropdownMenuItem<String>(
                       value: device.deviceId,
                       child: Text(
-                        device.label.isNotEmpty ? device.label : "Audio Channel ${device.deviceId.substring(0, 4)}",
+                        device.label.isNotEmpty
+                            ? device.label
+                            : "Audio Channel ${device.deviceId.length > 4 ? device.deviceId.substring(0, 4) : device.deviceId}",
                         style: const TextStyle(color: Colors.white, fontSize: 12),
                       ),
                     );
@@ -1037,18 +1201,21 @@ class _RoomScreenState extends State<RoomScreen> with TickerProviderStateMixin {
                 ],
 
                 // WS Url (Hidden inside settings expander for cleaner UX)
-                ExpansionTile(
-                  title: const Text("Advanced Server Settings", style: TextStyle(color: Colors.white60, fontSize: 12)),
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.only(top: 8, bottom: 16),
-                      child: TextField(
-                        controller: _wsUrlController,
-                        style: const TextStyle(color: Colors.white),
-                        decoration: _inputDecoration(Icons.settings_ethernet),
+                Material(
+                  color: Colors.transparent,
+                  child: ExpansionTile(
+                    title: const Text("Advanced Server Settings", style: TextStyle(color: Colors.white60, fontSize: 12)),
+                    children: [
+                      Padding(
+                        padding: const EdgeInsets.only(top: 8, bottom: 16),
+                        child: TextField(
+                          controller: _wsUrlController,
+                          style: const TextStyle(color: Colors.white),
+                          decoration: _inputDecoration(Icons.settings_ethernet),
+                        ),
                       ),
-                    ),
-                  ],
+                    ],
+                  ),
                 ),
                 const SizedBox(height: 24),
 
